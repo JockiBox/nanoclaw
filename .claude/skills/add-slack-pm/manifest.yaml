@@ -1,0 +1,17 @@
+# .claude/skills/add-slack-pm/manifest.yaml
+skill: slack-pm
+version: 1.0.0
+description: "Slack Lists & Canvas PM tools for the container agent"
+core_version: 0.1.0
+adds:
+  - container/skills/slack-pm/SKILL.md
+  - container/bin/slack-lists
+  - container/bin/slack-canvas
+modifies:
+  - container/Dockerfile
+structured:
+  env_additions: []
+conflicts: []
+depends:
+  - slack
+test: "./container/build.sh"
