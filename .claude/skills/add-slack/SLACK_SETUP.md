@@ -60,6 +60,19 @@ These scopes control what the bot is allowed to do.
 | `groups:read` | List private channels (for metadata sync) |
 | `users:read` | Look up user display names |
 
+### Additional scopes for Slack PM (Lists & Canvas)
+
+If you've applied the `add-slack-pm` skill, also add these scopes:
+
+| Scope | Why it's needed |
+|-------|----------------|
+| `lists:read` | Read list items and download lists |
+| `lists:write` | Create, update, and delete lists and list items |
+| `canvases:read` | Look up canvas sections |
+| `canvases:write` | Create, edit, and delete canvases |
+
+After adding scopes, you must **reinstall the app** to your workspace.
+
 ## Step 5: Install to Workspace
 
 1. In the sidebar, click **Install App**
