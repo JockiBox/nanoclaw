@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# slack-lists — CLI wrapper for the Slack Lists API
+#
+# Reads SLACK_BOT_TOKEN from the environment.  All successful responses are
+# printed as formatted JSON to stdout.  Errors go to stderr with exit 1.
+# ---------------------------------------------------------------------------
+
+if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+  echo "Error: SLACK_BOT_TOKEN is not set." >&2
+  echo "Export it before calling this script, e.g.:" >&2
+  echo "  export SLACK_BOT_TOKEN=xoxb-..." >&2
+  exit 1
+fi
+
+SLACK_API="https://slack.com/api"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Usage: slack-lists <command> [subcommand] [options]
+
+Commands:
+  create <name>                         Create a new list
+    --description "..."                 Optional description
+    --todo                              Create as a TODO list
+    --schema '<json>'                   Column definitions JSON array
+
+  update <list_id>                      Update list metadata
+    --name "..."                        New name
+    --description "..."                 New description
+
+  items list <list_id>                  List items in a list
+    --limit N                           Max items to return
+    --offset N                          Pagination offset
+
+  items info <list_id> <item_id>        Get details of a single item
+
+  items create <list_id>                Add an item to a list
+    --fields '<json>'                   Required: array of {name, value}
+    --parent <item_id>                  Optional parent (for subtasks)
+
+  items update <list_id> <item_id>      Update an item's fields
+    --updates '<json>'                  Required: object of name->value pairs
+
+  items delete <list_id> <item_id>      Delete a single item
+
+  items delete-multiple <list_id>       Delete several items at once
+    --ids 'id1,id2,...'                 Required: comma-separated item IDs
+
+  download <list_id>                    Download a list as CSV (polls until ready)
+
+  access set <list_id>                  Grant channel access to a list
+    --channels C123,C456                Required: comma-separated channel IDs
+    --level <read|write>                Required: access level
+
+  access remove <list_id>              Revoke channel access from a list
+    --channels C123,C456                Required: comma-separated channel IDs
+
+Options:
+  --help, -h                            Show this help message
+EOF
+  exit 0
+}
+
+# Make a Slack API call, check .ok, and output the response.
+# Usage: slack_api <METHOD> <endpoint> [curl-args...]
+slack_api() {
+  local method="$1" endpoint="$2"
+  shift 2
+  local response
+  response=$(curl -s -X "$method" "$SLACK_API/$endpoint" \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    "$@")
+  local ok
+  ok=$(echo "$response" | jq -r '.ok')
+  if [ "$ok" != "true" ]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown_error"')" >&2
+    echo "$response" | jq . >&2
+    exit 1
+  fi
+  echo "$response" | jq .
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  if [ $# -lt 1 ]; then
+    echo "Error: create requires a list name." >&2
+    echo "Usage: slack-lists create <name> [--description '...'] [--todo] [--schema '<json>']" >&2
+    exit 1
+  fi
+
+  local name="$1"; shift
+  local description="" todo="false" schema=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --description) description="$2"; shift 2 ;;
+      --todo)        todo="true"; shift ;;
+      --schema)      schema="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  local body
+  body=$(jq -n \
+    --arg name "$name" \
+    --arg description "$description" \
+    --arg todo "$todo" \
+    --arg schema "$schema" \
+    '{name: $name} +
+     (if $description != "" then {description: $description} else {} end) +
+     (if $todo == "true" then {type: "todo"} else {} end) +
+     (if $schema != "" then {schema: ($schema | fromjson)} else {} end)')
+
+  slack_api POST "slackLists.create" -d "$body"
+}
+
+cmd_update() {
+  if [ $# -lt 1 ]; then
+    echo "Error: update requires a list_id." >&2
+    echo "Usage: slack-lists update <list_id> [--name '...'] [--description '...']" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local name="" description=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)        name="$2"; shift 2 ;;
+      --description) description="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  local body
+  body=$(jq -n \
+    --arg list_id "$list_id" \
+    --arg name "$name" \
+    --arg description "$description" \
+    '{list_id: $list_id} +
+     (if $name != "" then {name: $name} else {} end) +
+     (if $description != "" then {description: $description} else {} end)')
+
+  slack_api POST "slackLists.update" -d "$body"
+}
+
+cmd_items_list() {
+  if [ $# -lt 1 ]; then
+    echo "Error: items list requires a list_id." >&2
+    echo "Usage: slack-lists items list <list_id> [--limit N] [--offset N]" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local limit="" offset=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --limit)  limit="$2"; shift 2 ;;
+      --offset) offset="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  local query="list_id=$list_id"
+  [ -n "$limit" ]  && query="$query&limit=$limit"
+  [ -n "$offset" ] && query="$query&offset=$offset"
+
+  slack_api GET "slackLists.items.list?$query"
+}
+
+cmd_items_info() {
+  if [ $# -lt 2 ]; then
+    echo "Error: items info requires a list_id and item_id." >&2
+    echo "Usage: slack-lists items info <list_id> <item_id>" >&2
+    exit 1
+  fi
+
+  local list_id="$1" item_id="$2"
+  slack_api GET "slackLists.items.info?list_id=$list_id&item_id=$item_id"
+}
+
+cmd_items_create() {
+  if [ $# -lt 1 ]; then
+    echo "Error: items create requires a list_id." >&2
+    echo "Usage: slack-lists items create <list_id> --fields '<json>' [--parent <item_id>]" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local fields="" parent=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fields) fields="$2"; shift 2 ;;
+      --parent) parent="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$fields" ]; then
+    echo "Error: --fields is required for items create." >&2
+    echo "Usage: slack-lists items create <list_id> --fields '<json>' [--parent <item_id>]" >&2
+    exit 1
+  fi
+
+  local body
+  body=$(jq -n \
+    --arg list_id "$list_id" \
+    --arg fields "$fields" \
+    --arg parent "$parent" \
+    '{list_id: $list_id, fields: ($fields | fromjson)} +
+     (if $parent != "" then {parent_id: $parent} else {} end)')
+
+  slack_api POST "slackLists.items.create" -d "$body"
+}
+
+cmd_items_update() {
+  if [ $# -lt 2 ]; then
+    echo "Error: items update requires a list_id and item_id." >&2
+    echo "Usage: slack-lists items update <list_id> <item_id> --updates '<json>'" >&2
+    exit 1
+  fi
+
+  local list_id="$1" item_id="$2"; shift 2
+  local updates=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --updates) updates="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$updates" ]; then
+    echo "Error: --updates is required for items update." >&2
+    echo "Usage: slack-lists items update <list_id> <item_id> --updates '<json>'" >&2
+    exit 1
+  fi
+
+  local body
+  body=$(jq -n \
+    --arg list_id "$list_id" \
+    --arg item_id "$item_id" \
+    --arg updates "$updates" \
+    '{list_id: $list_id, item_id: $item_id, updates: ($updates | fromjson)}')
+
+  slack_api POST "slackLists.items.update" -d "$body"
+}
+
+cmd_items_delete() {
+  if [ $# -lt 2 ]; then
+    echo "Error: items delete requires a list_id and item_id." >&2
+    echo "Usage: slack-lists items delete <list_id> <item_id>" >&2
+    exit 1
+  fi
+
+  local list_id="$1" item_id="$2"
+  local body
+  body=$(jq -n --arg list_id "$list_id" --arg item_id "$item_id" \
+    '{list_id: $list_id, item_id: $item_id}')
+
+  slack_api POST "slackLists.items.delete" -d "$body"
+}
+
+cmd_items_delete_multiple() {
+  if [ $# -lt 1 ]; then
+    echo "Error: items delete-multiple requires a list_id." >&2
+    echo "Usage: slack-lists items delete-multiple <list_id> --ids 'id1,id2,...'" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local ids=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ids) ids="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$ids" ]; then
+    echo "Error: --ids is required for items delete-multiple." >&2
+    echo "Usage: slack-lists items delete-multiple <list_id> --ids 'id1,id2,...'" >&2
+    exit 1
+  fi
+
+  # Convert comma-separated IDs to a JSON array
+  local ids_json
+  ids_json=$(echo "$ids" | jq -R 'split(",")')
+
+  local body
+  body=$(jq -n --arg list_id "$list_id" --argjson ids "$ids_json" \
+    '{list_id: $list_id, item_ids: $ids}')
+
+  slack_api POST "slackLists.items.deleteMultiple" -d "$body"
+}
+
+cmd_download() {
+  if [ $# -lt 1 ]; then
+    echo "Error: download requires a list_id." >&2
+    echo "Usage: slack-lists download <list_id>" >&2
+    exit 1
+  fi
+
+  local list_id="$1"
+
+  # Start the download
+  local start_body
+  start_body=$(jq -n --arg list_id "$list_id" '{list_id: $list_id}')
+
+  local start_response
+  start_response=$(curl -s -X POST "$SLACK_API/slackLists.download.start" \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    -d "$start_body")
+
+  local ok
+  ok=$(echo "$start_response" | jq -r '.ok')
+  if [ "$ok" != "true" ]; then
+    echo "Error: $(echo "$start_response" | jq -r '.error // "unknown_error"')" >&2
+    echo "$start_response" | jq . >&2
+    exit 1
+  fi
+
+  local download_id
+  download_id=$(echo "$start_response" | jq -r '.download_id')
+
+  if [ -z "$download_id" ] || [ "$download_id" = "null" ]; then
+    echo "Error: no download_id returned from download.start" >&2
+    echo "$start_response" | jq . >&2
+    exit 1
+  fi
+
+  echo "Download started (id: $download_id). Polling for completion..." >&2
+
+  # Poll until the download is ready
+  local max_attempts=30
+  local attempt=0
+  while [ $attempt -lt $max_attempts ]; do
+    local poll_response
+    poll_response=$(curl -s -X GET \
+      "$SLACK_API/slackLists.download.get?download_id=$download_id" \
+      -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+      -H "Content-Type: application/json; charset=utf-8")
+
+    local poll_ok
+    poll_ok=$(echo "$poll_response" | jq -r '.ok')
+    if [ "$poll_ok" != "true" ]; then
+      local error
+      error=$(echo "$poll_response" | jq -r '.error // "unknown_error"')
+      # "download_not_ready" means we should keep polling
+      if [ "$error" = "download_not_ready" ]; then
+        attempt=$((attempt + 1))
+        sleep 2
+        continue
+      fi
+      echo "Error: $error" >&2
+      echo "$poll_response" | jq . >&2
+      exit 1
+    fi
+
+    # Download is ready
+    echo "$poll_response" | jq .
+    return 0
+  done
+
+  echo "Error: download timed out after $((max_attempts * 2)) seconds." >&2
+  exit 1
+}
+
+cmd_access_set() {
+  if [ $# -lt 1 ]; then
+    echo "Error: access set requires a list_id." >&2
+    echo "Usage: slack-lists access set <list_id> --channels C123,C456 --level <read|write>" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local channels="" level=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channels) channels="$2"; shift 2 ;;
+      --level)    level="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$channels" ]; then
+    echo "Error: --channels is required for access set." >&2
+    exit 1
+  fi
+  if [ -z "$level" ]; then
+    echo "Error: --level is required for access set." >&2
+    exit 1
+  fi
+  if [ "$level" != "read" ] && [ "$level" != "write" ]; then
+    echo "Error: --level must be 'read' or 'write', got '$level'." >&2
+    exit 1
+  fi
+
+  local channels_json
+  channels_json=$(echo "$channels" | jq -R 'split(",")')
+
+  local body
+  body=$(jq -n \
+    --arg list_id "$list_id" \
+    --argjson channels "$channels_json" \
+    --arg level "$level" \
+    '{list_id: $list_id, channel_ids: $channels, level: $level}')
+
+  slack_api POST "slackLists.access.set" -d "$body"
+}
+
+cmd_access_remove() {
+  if [ $# -lt 1 ]; then
+    echo "Error: access remove requires a list_id." >&2
+    echo "Usage: slack-lists access remove <list_id> --channels C123,C456" >&2
+    exit 1
+  fi
+
+  local list_id="$1"; shift
+  local channels=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channels) channels="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$channels" ]; then
+    echo "Error: --channels is required for access remove." >&2
+    exit 1
+  fi
+
+  local channels_json
+  channels_json=$(echo "$channels" | jq -R 'split(",")')
+
+  local body
+  body=$(jq -n \
+    --arg list_id "$list_id" \
+    --argjson channels "$channels_json" \
+    '{list_id: $list_id, channel_ids: $channels}')
+
+  slack_api POST "slackLists.access.delete" -d "$body"
+}
+
+# ---------------------------------------------------------------------------
+# Main routing
+# ---------------------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+case "$1" in
+  --help|-h)
+    usage
+    ;;
+  create)
+    shift
+    cmd_create "$@"
+    ;;
+  update)
+    shift
+    cmd_update "$@"
+    ;;
+  items)
+    if [ $# -lt 2 ]; then
+      echo "Error: items requires a subcommand (list, info, create, update, delete, delete-multiple)." >&2
+      exit 1
+    fi
+    subcmd="$2"; shift 2
+    case "$subcmd" in
+      list)            cmd_items_list "$@" ;;
+      info)            cmd_items_info "$@" ;;
+      create)          cmd_items_create "$@" ;;
+      update)          cmd_items_update "$@" ;;
+      delete-multiple) cmd_items_delete_multiple "$@" ;;
+      delete)          cmd_items_delete "$@" ;;
+      *)
+        echo "Error: unknown items subcommand '$subcmd'." >&2
+        echo "Valid subcommands: list, info, create, update, delete, delete-multiple" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  download)
+    shift
+    cmd_download "$@"
+    ;;
+  access)
+    if [ $# -lt 2 ]; then
+      echo "Error: access requires a subcommand (set, remove)." >&2
+      exit 1
+    fi
+    subcmd="$2"; shift 2
+    case "$subcmd" in
+      set)    cmd_access_set "$@" ;;
+      remove) cmd_access_remove "$@" ;;
+      *)
+        echo "Error: unknown access subcommand '$subcmd'." >&2
+        echo "Valid subcommands: set, remove" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "Error: unknown command '$1'." >&2
+    echo "Run 'slack-lists --help' for usage." >&2
+    exit 1
+    ;;
+esac
