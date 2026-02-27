@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# slack-canvas — CLI wrapper for the Slack Canvas API
+#
+# Reads SLACK_BOT_TOKEN from the environment.  All successful responses are
+# printed as formatted JSON to stdout.  Errors go to stderr with exit 1.
+# ---------------------------------------------------------------------------
+
+if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+  echo "Error: SLACK_BOT_TOKEN is not set." >&2
+  echo "Export it before calling this script, e.g.:" >&2
+  echo "  export SLACK_BOT_TOKEN=xoxb-..." >&2
+  exit 1
+fi
+
+SLACK_API="https://slack.com/api"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Usage: slack-canvas <command> [subcommand] [options]
+
+Commands:
+  create <title>                        Create a new canvas
+    --markdown "# Content"              Required: markdown content (use - for stdin)
+    --channel <channel_id>              Optional: tab the canvas in a channel
+
+  channel-create <channel_id>           Create a channel canvas (one per channel)
+    --title "..."                       Optional title
+    --markdown "..."                    Optional markdown content (use - for stdin)
+
+  edit <canvas_id>                      Edit a canvas (replace all content)
+    --markdown "# Updated content"      Required: markdown content (use - for stdin)
+
+  delete <canvas_id>                    Delete a canvas
+
+  sections <canvas_id>                  Look up sections in a canvas
+    --criteria '<json>'                 Required: criteria JSON (e.g. '{"contains_text":"Intro"}')
+
+  access set <canvas_id>               Grant channel access to a canvas
+    --channels C123,C456                Required: comma-separated channel IDs
+    --level <read|write>                Required: access level
+
+  access remove <canvas_id>            Revoke channel access from a canvas
+    --channels C123,C456                Required: comma-separated channel IDs
+
+Options:
+  --help, -h                            Show this help message
+EOF
+  exit 0
+}
+
+# Make a Slack API call, check .ok, and output the response.
+# Usage: slack_api <METHOD> <endpoint> [curl-args...]
+slack_api() {
+  local method="$1" endpoint="$2"
+  shift 2
+  local response
+  response=$(curl -s -X "$method" "$SLACK_API/$endpoint" \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    "$@")
+  local ok
+  ok=$(echo "$response" | jq -r '.ok')
+  if [ "$ok" != "true" ]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown_error"')" >&2
+    echo "$response" | jq . >&2
+    exit 1
+  fi
+  echo "$response" | jq .
+}
+
+# Read markdown content: if the value is "-", read from stdin; otherwise use as-is.
+read_markdown() {
+  local value="$1"
+  if [ "$value" = "-" ]; then
+    cat
+  else
+    echo "$value"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  if [ $# -lt 1 ]; then
+    echo "Error: create requires a title." >&2
+    echo "Usage: slack-canvas create <title> --markdown '...' [--channel <channel_id>]" >&2
+    exit 1
+  fi
+
+  local title="$1"; shift
+  local markdown="" channel=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --markdown) markdown="$2"; shift 2 ;;
+      --channel)  channel="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$markdown" ]; then
+    echo "Error: --markdown is required for create." >&2
+    echo "Usage: slack-canvas create <title> --markdown '...' [--channel <channel_id>]" >&2
+    exit 1
+  fi
+
+  local content
+  content=$(read_markdown "$markdown")
+
+  local body
+  body=$(jq -n \
+    --arg title "$title" \
+    --arg content "$content" \
+    --arg channel "$channel" \
+    '{title: $title, document_content: {type: "markdown", markdown: $content}} +
+     (if $channel != "" then {channel_id: $channel} else {} end)')
+
+  slack_api POST "canvases.create" -d "$body"
+}
+
+cmd_channel_create() {
+  if [ $# -lt 1 ]; then
+    echo "Error: channel-create requires a channel_id." >&2
+    echo "Usage: slack-canvas channel-create <channel_id> [--title '...'] [--markdown '...']" >&2
+    exit 1
+  fi
+
+  local channel_id="$1"; shift
+  local title="" markdown=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title)    title="$2"; shift 2 ;;
+      --markdown) markdown="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  local content=""
+  if [ -n "$markdown" ]; then
+    content=$(read_markdown "$markdown")
+  fi
+
+  local body
+  body=$(jq -n \
+    --arg channel_id "$channel_id" \
+    --arg title "$title" \
+    --arg content "$content" \
+    '{channel_id: $channel_id} +
+     (if $title != "" then {title: $title} else {} end) +
+     (if $content != "" then {document_content: {type: "markdown", markdown: $content}} else {} end)')
+
+  slack_api POST "conversations.canvases.create" -d "$body"
+}
+
+cmd_edit() {
+  if [ $# -lt 1 ]; then
+    echo "Error: edit requires a canvas_id." >&2
+    echo "Usage: slack-canvas edit <canvas_id> --markdown '...'" >&2
+    exit 1
+  fi
+
+  local canvas_id="$1"; shift
+  local markdown=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --markdown) markdown="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$markdown" ]; then
+    echo "Error: --markdown is required for edit." >&2
+    echo "Usage: slack-canvas edit <canvas_id> --markdown '...'" >&2
+    exit 1
+  fi
+
+  local content
+  content=$(read_markdown "$markdown")
+
+  local body
+  body=$(jq -n \
+    --arg canvas_id "$canvas_id" \
+    --arg content "$content" \
+    '{canvas_id: $canvas_id, changes: [{operation: "replace", document_content: {type: "markdown", markdown: $content}}]}')
+
+  slack_api POST "canvases.edit" -d "$body"
+}
+
+cmd_delete() {
+  if [ $# -lt 1 ]; then
+    echo "Error: delete requires a canvas_id." >&2
+    echo "Usage: slack-canvas delete <canvas_id>" >&2
+    exit 1
+  fi
+
+  local canvas_id="$1"
+  local body
+  body=$(jq -n --arg canvas_id "$canvas_id" '{canvas_id: $canvas_id}')
+
+  slack_api POST "canvases.delete" -d "$body"
+}
+
+cmd_sections() {
+  if [ $# -lt 1 ]; then
+    echo "Error: sections requires a canvas_id." >&2
+    echo "Usage: slack-canvas sections <canvas_id> --criteria '<json>'" >&2
+    exit 1
+  fi
+
+  local canvas_id="$1"; shift
+  local criteria=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --criteria) criteria="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$criteria" ]; then
+    echo "Error: --criteria is required for sections." >&2
+    echo "Usage: slack-canvas sections <canvas_id> --criteria '<json>'" >&2
+    exit 1
+  fi
+
+  local body
+  body=$(jq -n \
+    --arg canvas_id "$canvas_id" \
+    --arg criteria "$criteria" \
+    '{canvas_id: $canvas_id, criteria: ($criteria | fromjson)}')
+
+  slack_api POST "canvases.sections.lookup" -d "$body"
+}
+
+cmd_access_set() {
+  if [ $# -lt 1 ]; then
+    echo "Error: access set requires a canvas_id." >&2
+    echo "Usage: slack-canvas access set <canvas_id> --channels C123,C456 --level <read|write>" >&2
+    exit 1
+  fi
+
+  local canvas_id="$1"; shift
+  local channels="" level=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channels) channels="$2"; shift 2 ;;
+      --level)    level="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$channels" ]; then
+    echo "Error: --channels is required for access set." >&2
+    exit 1
+  fi
+  if [ -z "$level" ]; then
+    echo "Error: --level is required for access set." >&2
+    exit 1
+  fi
+  if [ "$level" != "read" ] && [ "$level" != "write" ]; then
+    echo "Error: --level must be 'read' or 'write', got '$level'." >&2
+    exit 1
+  fi
+
+  local channels_json
+  channels_json=$(echo "$channels" | jq -R 'split(",")')
+
+  local body
+  body=$(jq -n \
+    --arg canvas_id "$canvas_id" \
+    --argjson channels "$channels_json" \
+    --arg level "$level" \
+    '{canvas_id: $canvas_id, channel_ids: $channels, access_level: $level}')
+
+  slack_api POST "canvases.access.set" -d "$body"
+}
+
+cmd_access_remove() {
+  if [ $# -lt 1 ]; then
+    echo "Error: access remove requires a canvas_id." >&2
+    echo "Usage: slack-canvas access remove <canvas_id> --channels C123,C456" >&2
+    exit 1
+  fi
+
+  local canvas_id="$1"; shift
+  local channels=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --channels) channels="$2"; shift 2 ;;
+      *) echo "Error: unknown option '$1'" >&2; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$channels" ]; then
+    echo "Error: --channels is required for access remove." >&2
+    exit 1
+  fi
+
+  local channels_json
+  channels_json=$(echo "$channels" | jq -R 'split(",")')
+
+  local body
+  body=$(jq -n \
+    --arg canvas_id "$canvas_id" \
+    --argjson channels "$channels_json" \
+    '{canvas_id: $canvas_id, channel_ids: $channels}')
+
+  slack_api POST "canvases.access.delete" -d "$body"
+}
+
+# ---------------------------------------------------------------------------
+# Main routing
+# ---------------------------------------------------------------------------
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+case "$1" in
+  --help|-h)
+    usage
+    ;;
+  create)
+    shift
+    cmd_create "$@"
+    ;;
+  channel-create)
+    shift
+    cmd_channel_create "$@"
+    ;;
+  edit)
+    shift
+    cmd_edit "$@"
+    ;;
+  delete)
+    shift
+    cmd_delete "$@"
+    ;;
+  sections)
+    shift
+    cmd_sections "$@"
+    ;;
+  access)
+    if [ $# -lt 2 ]; then
+      echo "Error: access requires a subcommand (set, remove)." >&2
+      exit 1
+    fi
+    subcmd="$2"; shift 2
+    case "$subcmd" in
+      set)    cmd_access_set "$@" ;;
+      remove) cmd_access_remove "$@" ;;
+      *)
+        echo "Error: unknown access subcommand '$subcmd'." >&2
+        echo "Valid subcommands: set, remove" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "Error: unknown command '$1'." >&2
+    echo "Run 'slack-canvas --help' for usage." >&2
+    exit 1
+    ;;
+esac
