@@ -11,7 +11,7 @@ allowed-tools: Bash(slack-lists:*, slack-canvas:*)
 ```bash
 slack-lists create "Sprint 42" --schema '[{"name":"Task","type":"text"},{"name":"Status","type":"select"},{"name":"Assignee","type":"user"},{"name":"Due Date","type":"date"},{"name":"Priority","type":"select"}]'
 slack-lists items create <list_id> --fields '[{"name":"Task","value":"Build login page"},{"name":"Status","value":"To Do"},{"name":"Priority","value":"High"}]'
-slack-canvas create "Project Brief" --markdown - <<< "# Project Brief\n\n## Goals\n..."
+slack-canvas create "Project Brief" --markdown $'# Project Brief\n\n## Goals\n...'
 slack-lists items list <list_id>
 ```
 

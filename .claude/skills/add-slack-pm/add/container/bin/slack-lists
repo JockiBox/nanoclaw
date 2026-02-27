@@ -78,6 +78,11 @@ slack_api() {
     -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
     -H "Content-Type: application/json; charset=utf-8" \
     "$@")
+  if ! echo "$response" | jq -e . >/dev/null 2>&1; then
+    echo "Error: Non-JSON response from Slack API" >&2
+    echo "$response" >&2
+    exit 1
+  fi
   local ok
   ok=$(echo "$response" | jq -r '.ok')
   if [ "$ok" != "true" ]; then

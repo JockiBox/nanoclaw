@@ -45,11 +45,11 @@ RUN npm install
 # Copy source code
 COPY agent-runner/ ./
 
-# Copy Slack PM CLI scripts into PATH
-COPY bin/ /usr/local/bin/
-
 # Build TypeScript
 RUN npm run build
+
+# Copy Slack PM CLI scripts into PATH (after build for better cache)
+COPY bin/ /usr/local/bin/
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
