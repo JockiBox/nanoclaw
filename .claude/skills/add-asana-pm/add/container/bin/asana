@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# asana — CLI wrapper for the Asana REST API
+#
+# Reads ASANA_ACCESS_TOKEN, ASANA_WORKSPACE_ID, and optionally
+# ASANA_DEFAULT_PROJECT_ID from the environment.
+# All successful responses are printed as formatted JSON to stdout.
+# Errors go to stderr with exit 1.
+# ---------------------------------------------------------------------------
+
+if [ -z "${ASANA_ACCESS_TOKEN:-}" ]; then
+  echo "Error: ASANA_ACCESS_TOKEN is not set." >&2
+  echo "Export it before calling this script, e.g.:" >&2
+  echo "  export ASANA_ACCESS_TOKEN=1/12345..." >&2
+  exit 1
+fi
+
+ASANA_API="https://app.asana.com/api/1.0"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Usage: asana <command> [subcommand] [options]
+
+Commands:
+  tasks list                          List tasks in a project
+    --project <gid>                   Project GID (or uses ASANA_DEFAULT_PROJECT_ID)
+    --assignee <email|gid|me>         Filter by assignee
+    --completed <true|false>          Filter by completion status (default: false)
+    --section <gid>                   Filter by section
+    --modified-since <ISO-date>       Tasks modified after this date
+    --limit <N>                       Max results (1-100, default 100)
+    --fields <csv>                    Extra fields (default: name,assignee.name,completed,due_on,notes)
+
+  tasks create <name>                 Create a new task
+    --project <gid>                   Project GID (or uses ASANA_DEFAULT_PROJECT_ID)
+    --assignee <email|gid>            Assign to user
+    --due <YYYY-MM-DD>                Due date
+    --notes "..."                     Description
+    --section <gid>                   Add to section
+
+  tasks update <gid>                  Update an existing task
+    --name "..."                      New name
+    --assignee <email|gid>            New assignee
+    --due <YYYY-MM-DD>                New due date
+    --notes "..."                     New description
+    --completed <true|false>          Mark complete/incomplete
+
+  tasks get <gid>                     Get full task details
+    --fields <csv>                    Extra fields to include
+
+  tasks search <query>                Search tasks by text
+    --project <gid>                   Scope to project
+    --assignee <email|gid|me>         Filter by assignee
+    --completed <true|false>          Filter by completion
+    --due-on <YYYY-MM-DD>             Tasks due on exact date
+    --due-before <YYYY-MM-DD>         Tasks due before date
+    --due-after <YYYY-MM-DD>          Tasks due after date
+    --completed-after <YYYY-MM-DD>    Tasks completed after date
+    --limit <N>                       Max results (default 20)
+
+  tasks due [today|week|overdue]      Shortcut: tasks by due date
+    --project <gid>                   Scope to project
+    --assignee <email|gid|me>         Filter by assignee
+
+  projects list                       List all projects in workspace
+    --team <gid>                      Filter by team
+    --archived <true|false>           Include archived (default: false)
+
+  projects get <gid>                  Get project details
+    --sections                        Include sections
+
+  sections list <project_gid>         List sections in a project
+
+  users list                          List workspace users
+  users me                            Get current user info
+
+  help                                Show this help
+EOF
+}
+
+api_call() {
+  local method="$1"
+  local endpoint="$2"
+  shift 2
+  local response
+  local http_code
+
+  response=$(curl -s -w "\n%{http_code}" \
+    -X "$method" \
+    -H "Authorization: Bearer $ASANA_ACCESS_TOKEN" \
+    -H "Content-Type: application/json" \
+    "$@" \
+    "${ASANA_API}${endpoint}")
+
+  http_code=$(echo "$response" | tail -n1)
+  local body
+  body=$(echo "$response" | sed '$d')
+
+  if [ "$http_code" -ge 400 ]; then
+    local errors
+    errors=$(echo "$body" | jq -r '.errors[]?.message // "Unknown error"' 2>/dev/null || echo "$body")
+    echo "Error ($http_code): $errors" >&2
+    return 1
+  fi
+
+  echo "$body" | jq '.'
+}
+
+resolve_project() {
+  local project="${1:-${ASANA_DEFAULT_PROJECT_ID:-}}"
+  if [ -z "$project" ]; then
+    echo "Error: No project specified and ASANA_DEFAULT_PROJECT_ID is not set." >&2
+    echo "Use --project <gid> or set ASANA_DEFAULT_PROJECT_ID." >&2
+    return 1
+  fi
+  echo "$project"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_tasks_list() {
+  local project="" assignee="" completed="false" section="" modified_since="" limit="100"
+  local fields="name,assignee.name,completed,due_on,notes"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)    project="$2"; shift 2 ;;
+      --assignee)   assignee="$2"; shift 2 ;;
+      --completed)  completed="$2"; shift 2 ;;
+      --section)    section="$2"; shift 2 ;;
+      --modified-since) modified_since="$2"; shift 2 ;;
+      --limit)      limit="$2"; shift 2 ;;
+      --fields)     fields="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local params="opt_fields=${fields}&limit=${limit}"
+
+  if [ -n "$section" ]; then
+    params="${params}&section=${section}"
+  elif [ -n "$assignee" ]; then
+    params="${params}&assignee=${assignee}&workspace=${ASANA_WORKSPACE_ID:-}"
+  else
+    project=$(resolve_project "$project") || return 1
+    params="${params}&project=${project}"
+  fi
+
+  if [ "$completed" = "false" ]; then
+    params="${params}&completed_since=now"
+  fi
+
+  if [ -n "$modified_since" ]; then
+    params="${params}&modified_since=${modified_since}"
+  fi
+
+  api_call GET "/tasks?${params}"
+}
+
+cmd_tasks_create() {
+  local name="$1"; shift
+  local project="" assignee="" due="" notes="" section=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)    project="$2"; shift 2 ;;
+      --assignee)   assignee="$2"; shift 2 ;;
+      --due)        due="$2"; shift 2 ;;
+      --notes)      notes="$2"; shift 2 ;;
+      --section)    section="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  project=$(resolve_project "$project") || return 1
+
+  local data
+  data=$(jq -n \
+    --arg name "$name" \
+    --arg project "$project" \
+    --arg assignee "$assignee" \
+    --arg due "$due" \
+    --arg notes "$notes" \
+    '{
+      data: {
+        name: $name,
+        projects: [$project]
+      }
+      | if $assignee != "" then . + {assignee: $assignee} else . end
+      | if $due != "" then . + {due_on: $due} else . end
+      | if $notes != "" then . + {notes: $notes} else . end
+    }')
+
+  local result
+  result=$(api_call POST "/tasks" -d "$data") || return 1
+  local gid
+  gid=$(echo "$result" | jq -r '.data.gid')
+
+  # Add to section if specified
+  if [ -n "$section" ] && [ -n "$gid" ] && [ "$gid" != "null" ]; then
+    api_call POST "/sections/${section}/addTask" \
+      -d "{\"data\":{\"task\":\"${gid}\"}}" > /dev/null 2>&1 || true
+  fi
+
+  echo "$result"
+}
+
+cmd_tasks_update() {
+  local gid="$1"; shift
+  local name="" assignee="" due="" notes="" completed=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)       name="$2"; shift 2 ;;
+      --assignee)   assignee="$2"; shift 2 ;;
+      --due)        due="$2"; shift 2 ;;
+      --notes)      notes="$2"; shift 2 ;;
+      --completed)  completed="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local data
+  data=$(jq -n \
+    --arg name "$name" \
+    --arg assignee "$assignee" \
+    --arg due "$due" \
+    --arg notes "$notes" \
+    --arg completed "$completed" \
+    '{
+      data: {}
+      | if $name != "" then . + {name: $name} else . end
+      | if $assignee != "" then . + {assignee: $assignee} else . end
+      | if $due != "" then . + {due_on: $due} else . end
+      | if $notes != "" then . + {notes: $notes} else . end
+      | if $completed != "" then . + {completed: ($completed == "true")} else . end
+    }')
+
+  api_call PUT "/tasks/${gid}" -d "$data"
+}
+
+cmd_tasks_get() {
+  local gid="$1"; shift
+  local fields="name,assignee.name,completed,due_on,notes,projects.name,memberships.section.name,created_at,modified_at,permalink_url"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fields) fields="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  api_call GET "/tasks/${gid}?opt_fields=${fields}"
+}
+
+cmd_tasks_search() {
+  local query="" project="" assignee="" completed="" limit="20"
+  local due_on="" due_before="" due_after="" completed_after=""
+
+  # First arg is the query text (optional for date-only searches)
+  if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    query="$1"; shift
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)         project="$2"; shift 2 ;;
+      --assignee)        assignee="$2"; shift 2 ;;
+      --completed)       completed="$2"; shift 2 ;;
+      --due-on)          due_on="$2"; shift 2 ;;
+      --due-before)      due_before="$2"; shift 2 ;;
+      --due-after)       due_after="$2"; shift 2 ;;
+      --completed-after) completed_after="$2"; shift 2 ;;
+      --limit)           limit="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local workspace="${ASANA_WORKSPACE_ID:-}"
+  if [ -z "$workspace" ]; then
+    echo "Error: ASANA_WORKSPACE_ID is not set." >&2
+    return 1
+  fi
+
+  local params="opt_fields=name,assignee.name,completed,due_on,permalink_url&limit=${limit}"
+
+  if [ -n "$query" ]; then
+    params="${params}&text=${query}"
+  fi
+  if [ -n "$project" ]; then
+    params="${params}&projects.any=${project}"
+  fi
+  if [ -n "$assignee" ]; then
+    params="${params}&assignee.any=${assignee}"
+  fi
+  if [ "$completed" = "true" ]; then
+    params="${params}&completed=true"
+  elif [ "$completed" = "false" ]; then
+    params="${params}&completed=false"
+  fi
+  if [ -n "$due_on" ]; then
+    params="${params}&due_on=${due_on}"
+  fi
+  if [ -n "$due_before" ]; then
+    params="${params}&due_on.before=${due_before}"
+  fi
+  if [ -n "$due_after" ]; then
+    params="${params}&due_on.after=${due_after}"
+  fi
+  if [ -n "$completed_after" ]; then
+    params="${params}&completed_on.after=${completed_after}"
+  fi
+
+  api_call GET "/workspaces/${workspace}/tasks/search?${params}"
+}
+
+cmd_tasks_due() {
+  local range="${1:-today}"; shift 2>/dev/null || true
+  local project="" assignee=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)  project="$2"; shift 2 ;;
+      --assignee) assignee="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local today
+  today=$(date +%Y-%m-%d)
+
+  case "$range" in
+    today)
+      # Tasks due today
+      cmd_tasks_search --due-on "$today" --completed false ${project:+--project "$project"} ${assignee:+--assignee "$assignee"}
+      ;;
+    tomorrow)
+      local tomorrow
+      tomorrow=$(date -d "+1 day" +%Y-%m-%d 2>/dev/null || date -v+1d +%Y-%m-%d)
+      cmd_tasks_search --due-on "$tomorrow" --completed false ${project:+--project "$project"} ${assignee:+--assignee "$assignee"}
+      ;;
+    week)
+      # Tasks due in the next 7 days
+      local next_week
+      next_week=$(date -d "+7 days" +%Y-%m-%d 2>/dev/null || date -v+7d +%Y-%m-%d)
+      cmd_tasks_search --due-after "$today" --due-before "$next_week" --completed false ${project:+--project "$project"} ${assignee:+--assignee "$assignee"}
+      ;;
+    overdue)
+      # Tasks due before today that aren't complete
+      cmd_tasks_search --due-before "$today" --completed false ${project:+--project "$project"} ${assignee:+--assignee "$assignee"}
+      ;;
+    *)
+      echo "Unknown range: $range. Use: today, tomorrow, week, overdue" >&2
+      return 1
+      ;;
+  esac
+}
+
+cmd_projects_list() {
+  local team="" archived="false"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --team)      team="$2"; shift 2 ;;
+      --archived)  archived="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local workspace="${ASANA_WORKSPACE_ID:-}"
+  if [ -z "$workspace" ]; then
+    echo "Error: ASANA_WORKSPACE_ID is not set." >&2
+    return 1
+  fi
+
+  local params="workspace=${workspace}&opt_fields=name,archived,created_at,modified_at&archived=${archived}"
+  if [ -n "$team" ]; then
+    params="${params}&team=${team}"
+  fi
+
+  api_call GET "/projects?${params}"
+}
+
+cmd_projects_get() {
+  local gid="$1"; shift
+  local sections=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sections) sections=true; shift ;;
+      *) echo "Unknown option: $1" >&2; return 1 ;;
+    esac
+  done
+
+  local result
+  result=$(api_call GET "/projects/${gid}?opt_fields=name,notes,owner.name,members.name,created_at,modified_at,permalink_url") || return 1
+  echo "$result"
+
+  if [ "$sections" = true ]; then
+    echo "---sections---"
+    api_call GET "/projects/${gid}/sections?opt_fields=name"
+  fi
+}
+
+cmd_sections_list() {
+  local project_gid="$1"
+  api_call GET "/projects/${project_gid}/sections?opt_fields=name"
+}
+
+cmd_users_list() {
+  local workspace="${ASANA_WORKSPACE_ID:-}"
+  if [ -z "$workspace" ]; then
+    echo "Error: ASANA_WORKSPACE_ID is not set." >&2
+    return 1
+  fi
+  api_call GET "/workspaces/${workspace}/users?opt_fields=name,email"
+}
+
+cmd_users_me() {
+  api_call GET "/users/me?opt_fields=name,email,workspaces.name"
+}
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+if [ $# -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+command="$1"; shift
+
+case "$command" in
+  tasks)
+    if [ $# -lt 1 ]; then usage; exit 1; fi
+    subcommand="$1"; shift
+    case "$subcommand" in
+      list)   cmd_tasks_list "$@" ;;
+      create) cmd_tasks_create "$@" ;;
+      update) cmd_tasks_update "$@" ;;
+      get)    cmd_tasks_get "$@" ;;
+      search) cmd_tasks_search "$@" ;;
+      due)    cmd_tasks_due "$@" ;;
+      *)      echo "Unknown tasks subcommand: $subcommand" >&2; usage; exit 1 ;;
+    esac
+    ;;
+  projects)
+    if [ $# -lt 1 ]; then usage; exit 1; fi
+    subcommand="$1"; shift
+    case "$subcommand" in
+      list) cmd_projects_list "$@" ;;
+      get)  cmd_projects_get "$@" ;;
+      *)    echo "Unknown projects subcommand: $subcommand" >&2; usage; exit 1 ;;
+    esac
+    ;;
+  sections)
+    if [ $# -lt 1 ]; then usage; exit 1; fi
+    subcommand="$1"; shift
+    case "$subcommand" in
+      list) cmd_sections_list "$@" ;;
+      *)    echo "Unknown sections subcommand: $subcommand" >&2; usage; exit 1 ;;
+    esac
+    ;;
+  users)
+    if [ $# -lt 1 ]; then usage; exit 1; fi
+    subcommand="$1"; shift
+    case "$subcommand" in
+      list) cmd_users_list "$@" ;;
+      me)   cmd_users_me "$@" ;;
+      *)    echo "Unknown users subcommand: $subcommand" >&2; usage; exit 1 ;;
+    esac
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    echo "Unknown command: $command" >&2
+    usage
+    exit 1
+    ;;
+esac
