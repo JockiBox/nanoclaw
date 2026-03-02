@@ -1,0 +1,18 @@
+# .claude/skills/add-asana-pm/manifest.yaml
+skill: asana-pm
+version: 1.0.0
+description: "Asana PM integration for the container agent — create, query, and update tasks via CLI"
+core_version: 0.1.0
+adds:
+  - container/skills/asana-pm/SKILL.md
+  - container/bin/asana
+modifies:
+  - container/Dockerfile
+structured:
+  env_additions:
+    - ASANA_ACCESS_TOKEN
+    - ASANA_WORKSPACE_ID
+    - ASANA_DEFAULT_PROJECT_ID
+conflicts: []
+depends: []
+test: "./container/build.sh"
